@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="nl">
+<head>
+  <meta charset="utf-8" />
+  <style>
+    html, body { margin: 0; padding: 0; background: transparent; }
+    body { font-family: "Source Sans Pro", "Segoe UI", sans-serif; color: #1a1a1a; }
+    label { display: block; font-size: 14px; margin-bottom: 4px; }
+    textarea {
+      box-sizing: border-box;
+      width: 100%;
+      min-height: 64px;
+      resize: vertical;
+      padding: 8px 10px;
+      border: 1px solid rgba(49, 51, 63, 0.2);
+      border-radius: 8px;
+      font: 16px/1.4 "Source Sans Pro", "Segoe UI", sans-serif;
+      background: #f4f7fb;
+      color: inherit;
+    }
+    textarea:focus { outline: 2px solid #1f4e79; border-color: #1f4e79; }
+    .pad { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+    button {
+      min-width: 36px;
+      height: 32px;
+      padding: 0 8px;
+      border: 1px solid rgba(49, 51, 63, 0.2);
+      border-radius: 8px;
+      background: #ffffff;
+      color: inherit;
+      font: 16px/1 "Source Sans Pro", "Segoe UI", sans-serif;
+      cursor: pointer;
+    }
+    button:hover { border-color: #1f4e79; }
+  </style>
+</head>
+<body>
+  <label for="formula">Formule</label>
+  <textarea id="formula" placeholder="P = U*I" spellcheck="false"></textarea>
+  <div class="pad" id="pad"></div>
+  <script>
+    const ta = document.getElementById("formula");
+    const pad = document.getElementById("pad");
+    const tokens = ["α","β","γ","δ","Δ","ε","θ","λ","μ","ν","π","ρ","σ","τ","φ","ω","Ω"];
+    let sawRender = false;
+
+    function post(type, payload) {
+      window.parent.postMessage(Object.assign({ isStreamlitMessage: true, type: type }, payload), "*");
+    }
+
+    function sendValue() {
+      post("streamlit:setComponentValue", { value: ta.value, dataType: "json" });
+    }
+
+    function resize() {
+      const height = Math.ceil(document.body.scrollHeight);
+      if (height > 0) post("streamlit:setFrameHeight", { height: height });
+    }
+
+    let caret = null;
+
+    function rememberCaret() {
+      caret = { start: ta.selectionStart, end: ta.selectionEnd };
+    }
+
+    function insert(token) {
+      const start = caret ? caret.start : ta.value.length;
+      const end = caret ? caret.end : start;
+      ta.value = ta.value.slice(0, start) + token + ta.value.slice(end);
+      const cursor = start + token.length;
+      caret = { start: cursor, end: cursor };
+      ta.focus();
+      ta.setSelectionRange(cursor, cursor);
+      sendValue();
+    }
+
+    tokens.forEach(function (token) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.textContent = token;
+      button.addEventListener("mousedown", function (event) { event.preventDefault(); });
+      button.addEventListener("click", function () { insert(token); });
+      pad.appendChild(button);
+    });
+
+    const sqrt = document.createElement("button");
+    sqrt.type = "button";
+    sqrt.textContent = "√";
+    sqrt.title = "Wortel";
+    sqrt.addEventListener("mousedown", function (event) { event.preventDefault(); });
+    sqrt.addEventListener("click", function () { insert("sqrt("); });
+    pad.appendChild(sqrt);
+
+    ta.addEventListener("input", sendValue);
+    ta.addEventListener("keyup", rememberCaret);
+    ta.addEventListener("mouseup", rememberCaret);
+    ta.addEventListener("select", rememberCaret);
+    window.addEventListener("message", function (event) {
+      const data = event.data;
+      if (!data || data.type !== "streamlit:render") return;
+      const text = data.args && typeof data.args.text === "string" ? data.args.text : "";
+      if (!sawRender || (document.activeElement !== ta && ta.value !== text)) {
+        ta.value = text;
+        caret = null;
+      }
+      sawRender = true;
+      requestAnimationFrame(resize);
+      if (data.theme) {
+        if (data.theme.textColor) document.body.style.color = data.theme.textColor;
+        if (data.theme.secondaryBackgroundColor) ta.style.background = data.theme.secondaryBackgroundColor;
+        if (data.theme.primaryColor) ta.style.caretColor = data.theme.primaryColor;
+      }
+      resize();
+    });
+
+    function announce() {
+      post("streamlit:componentReady", { apiVersion: 1 });
+      resize();
+    }
+    announce();
+    const readyTimer = setInterval(function () {
+      if (sawRender) {
+        clearInterval(readyTimer);
+        resize();
+        return;
+      }
+      announce();
+    }, 100);
+  </script>
+</body>
+</html>
