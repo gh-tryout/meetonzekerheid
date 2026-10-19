@@ -33,6 +33,7 @@ from engine import (
 
 COLUMNS = [
     "variabele",
+    "omschrijving",
     "waarde",
     "eenheid",
     "type",
@@ -47,6 +48,7 @@ _NAME = re.compile(r"[^\w\- ]+", re.UNICODE)
 
 EXAMPLE_INPUTS = {
     "U": {
+        "omschrijving": "spanning",
         "waarde": "10",
         "eenheid": "V",
         "type": "Type B",
@@ -57,6 +59,7 @@ EXAMPLE_INPUTS = {
         "opmerking": "spanning",
     },
     "I": {
+        "omschrijving": "stroom",
         "waarde": "2",
         "eenheid": "A",
         "type": "Type B",
@@ -70,9 +73,11 @@ EXAMPLE_INPUTS = {
 
 SAMPLE_CSV = "meting\n1,98\n2,01\n1,99\n2,02\n2,00\n1,97\n2,03\n"
 
-QUANTITY_WIDTHS = [1.05, 1.35, 0.85, 1.1, 1.2, 1.7, 0.65, 1.35, 1.9]
+# Omschrijving is about 20% of the row: 2.79 / (11.15 + 2.79).
+QUANTITY_WIDTHS = [1.05, 2.79, 1.35, 0.85, 1.1, 1.2, 1.7, 0.65, 1.35, 1.9]
 QUANTITY_HEADERS = [
     "Variabele",
+    "Omschrijving",
     "Waarde",
     "Eenheid",
     "Type",
@@ -98,10 +103,12 @@ def main() -> None:
     render_model()
     model = current_model()
     if model is None:
+        render_word_button(None, [], None, "")
         return
     rows = render_quantity_table(model)
     render_type_a(rows)
-    render_budget(model, rows)
+    budget, error = render_budget(model, rows)
+    render_word_button(model, rows, budget, error)
     render_sweep(model, rows)
 
 
@@ -139,10 +146,14 @@ def clear_model() -> None:
     st.session_state.inputs = {}
     st.session_state.measurements = {}
     st.session_state.result_unit = ""
+    st.session_state.save_name = ""
+    st.session_state.confidence = 0.95
     st.session_state.formula_generation += 1
     st.session_state.sweep_bounds_for = None
+    st.session_state.sweep_variable = None
     st.session_state.sweep_from = ""
     st.session_state.sweep_to = ""
+    st.session_state.measurement_generation = st.session_state.get("measurement_generation", 0) + 1
     drop_quantity_widgets()
     clear_type_a_widgets()
     reset_quantity_table()
@@ -152,14 +163,18 @@ def render_model() -> None:
     st.subheader("Meetmodel")
     with st.container(horizontal=True, gap="small"):
         st.button("Voorbeeld", on_click=load_example)
-        st.button("Wissen", on_click=clear_model)
+        st.button("Opnieuw beginnen", on_click=clear_model)
     st.session_state.formule = formula_input(
         st.session_state.formule,
         st.session_state.formula_generation,
     )
     st.caption(
         "Griekse tekens en het wortelteken worden op de cursorpositie ingevoegd. "
-        "Een subscript schrijf je als U_1. Vermenigvuldigen kan met * of door symbolen tegen elkaar, machten met ^."
+        "Aaneengesloten letters zijn één grootheid, zoals ab of ID_first. "
+        "Een subscript volgt op een liggend streepje, zoals U_1 of DP_max. "
+        "Een punt of een ster tussen grootheden is een vermenigvuldiging, zoals a.b of U*I. "
+        "Een getal direct voor een grootheid is ook een vermenigvuldiging, zoals 2U. "
+        "Een punt tussen cijfers blijft een decimaalteken, zoals 1.5. Machten schrijf je met ^."
     )
 
     formula = st.session_state.formule.strip()
@@ -173,7 +188,10 @@ def render_model() -> None:
         return
     st.latex(model.latex)
     if model.quantities:
-        st.caption("Grootheden in het model: " + ", ".join(f"`{name}`" for name in model.quantities))
+        st.markdown(
+            "Grootheden in het model: " + ", ".join(quantity_html(name) for name in model.quantities),
+            unsafe_allow_html=True,
+        )
     else:
         st.caption("Deze formule heeft geen invoergrootheden.")
     st.text_input("Eenheid van het resultaat", key="result_unit")
@@ -219,9 +237,13 @@ def render_quantity_row(name: str) -> dict:
         summary, _error = type_a_computation(name)
     locked = calculated_fields(summary, use_mean)
     cells = st.columns(QUANTITY_WIDTHS, gap="small", vertical_alignment="center")
-    cells[0].markdown(f"<div style='padding:8px 0'>{html.escape(name)}</div>", unsafe_allow_html=True)
+    cells[0].markdown(
+        f"<div style='padding:8px 0'>{quantity_html(name)}</div>",
+        unsafe_allow_html=True,
+    )
     displayed = {"variabele": name}
     fields = [
+        ("omschrijving", "Omschrijving", "text"),
         ("waarde", "Waarde", "text"),
         ("eenheid", "Eenheid", "text"),
         ("type", "Type", "type"),
@@ -419,6 +441,7 @@ def field_key(name: str, column: str) -> str:
 def ensure_quantity_fields(name: str) -> None:
     saved = dict(st.session_state.inputs.get(name, {}))
     defaults = {
+        "omschrijving": saved.get("omschrijving", ""),
         "waarde": saved.get("waarde", ""),
         "eenheid": saved.get("eenheid", ""),
         "type": saved.get("type", "Type B"),
@@ -533,7 +556,7 @@ def clear_type_a_widgets() -> None:
             st.session_state.pop(key, None)
 
 
-def render_budget(model: ParsedModel, rows: list[dict]) -> None:
+def render_budget(model: ParsedModel, rows: list[dict]) -> tuple[Budget | None, str]:
     st.subheader("Onzekerheidsbudget")
     confidence = st.selectbox(
         "Betrouwbaarheidsniveau",
@@ -545,8 +568,9 @@ def render_budget(model: ParsedModel, rows: list[dict]) -> None:
         budget = evaluate(model, [quantity_from_row(row) for row in rows], confidence)
     except FormulaError as exc:
         st.error(str(exc))
-        return
+        return None, str(exc)
     show_budget(budget)
+    return budget, ""
 
 
 def show_budget(budget: Budget) -> None:
@@ -558,32 +582,37 @@ def show_budget(budget: Budget) -> None:
     metrics[2].metric("uitgebreide onzekerheid U", fmt(budget.expanded) + suffix)
     relative = "—" if budget.relative is None else fmt(100 * budget.relative) + " %"
     metrics[3].metric("relatieve uc", relative)
-    st.write(
-        f"{budget.output} = {fmt(budget.nominal)} ± {fmt(budget.expanded)}{suffix} "
-        f"(k = {fmt(budget.coverage_factor)}, "
-        f"{fmt(100 * budget.confidence)} %, "
-        f"νeff = {fmt(budget.degrees_of_freedom)})"
+    st.markdown(
+        f"<p>{quantity_html(budget.output)} = {html.escape(fmt(budget.nominal))} "
+        f"± {html.escape(fmt(budget.expanded))}{html.escape(suffix)} "
+        f"(k = {html.escape(fmt(budget.coverage_factor))}, "
+        f"{html.escape(fmt(100 * budget.confidence))} %, "
+        f"ν<sub>eff</sub> = {html.escape(fmt(budget.degrees_of_freedom))})</p>",
+        unsafe_allow_html=True,
     )
-    table = pd.DataFrame(
+    budget_rows = [
         [
-            {
-                "grootheid": item.name,
-                "waarde": fmt(item.nominal),
-                "eenheid": item.unit,
-                "type": "A" if item.kind == "A" else "B",
-                "verdeling": item.distribution,
-                "omrekening": item.conversion,
-                "u": fmt(item.standard_uncertainty),
-                "ν": fmt(item.degrees_of_freedom),
-                "c": fmt(item.sensitivity),
-                "c·u": fmt(item.product),
-                "aandeel": f"{item.share:.1f} %".replace(".", ","),
-                "opmerking": item.comment,
-            }
-            for item in budget.contributions
+            quantity_html(item.name),
+            html.escape(fmt(item.nominal)),
+            html.escape(item.unit),
+            "A" if item.kind == "A" else "B",
+            html.escape(item.distribution),
+            html.escape(item.conversion),
+            html.escape(fmt(item.standard_uncertainty)),
+            html.escape(fmt(item.degrees_of_freedom)),
+            html.escape(fmt(item.sensitivity)),
+            html.escape(fmt(item.product)),
+            html.escape(f"{item.share:.1f} %".replace(".", ",")),
+            html.escape(item.comment),
         ]
+        for item in budget.contributions
+    ]
+    st.html(
+        html_table(
+            ["Grootheid", "Waarde", "Eenheid", "Type", "Verdeling", "Omrekening", "u", "ν", "c", "c·u", "Aandeel", "Opmerking"],
+            budget_rows,
+        )
     )
-    st.dataframe(table, hide_index=True)
     if budget.contributions:
         with st.expander("Gevoeligheidscoëfficiënten"):
             for item in budget.contributions:
@@ -956,6 +985,290 @@ def type_a_for_save() -> dict:
 def download_filename(name: str) -> str:
     cleaned = _NAME.sub("", str(name)).strip()
     return f"{cleaned or 'meting'}.json"
+
+
+def report_filename(name: str) -> str:
+    cleaned = _NAME.sub("", str(name)).strip()
+    return f"{cleaned or 'meetonzekerheid'}.html"
+
+
+def quantity_html(name: str) -> str:
+    """Show a quantity the way the formula does, with the subscript after _."""
+    return latex_to_html(sympy.latex(sympy.Symbol(name)))
+
+
+_LATEX_WORDS = {
+    "sin": "sin",
+    "cos": "cos",
+    "tan": "tan",
+    "log": "log",
+    "exp": "exp",
+    "cdot": " · ",
+    "times": " × ",
+    "pi": "π",
+    "alpha": "α",
+    "beta": "β",
+    "gamma": "γ",
+    "delta": "δ",
+    "epsilon": "ε",
+    "varepsilon": "ε",
+    "zeta": "ζ",
+    "eta": "η",
+    "theta": "θ",
+    "vartheta": "θ",
+    "iota": "ι",
+    "kappa": "κ",
+    "lambda": "λ",
+    "mu": "μ",
+    "nu": "ν",
+    "xi": "ξ",
+    "rho": "ρ",
+    "sigma": "σ",
+    "tau": "τ",
+    "upsilon": "υ",
+    "phi": "φ",
+    "varphi": "φ",
+    "chi": "χ",
+    "psi": "ψ",
+    "omega": "ω",
+    "Gamma": "Γ",
+    "Delta": "Δ",
+    "Theta": "Θ",
+    "Lambda": "Λ",
+    "Xi": "Ξ",
+    "Pi": "Π",
+    "Sigma": "Σ",
+    "Upsilon": "Υ",
+    "Phi": "Φ",
+    "Psi": "Ψ",
+    "Omega": "Ω",
+}
+
+
+def latex_to_html(source: str) -> str:
+    """Turn a SymPy formula into HTML that a browser and Word can both show."""
+    return _finish_formula(_latex_to_html(source))
+
+
+def _latex_to_html(source: str) -> str:
+    parts: list[str] = []
+    index = 0
+    length = len(source)
+    while index < length:
+        if source[index].isspace():
+            parts.append(" ")
+            index += 1
+            continue
+        if source.startswith("\\frac", index):
+            index += 5
+            numerator, index = _latex_braces(source, index)
+            denominator, index = _latex_braces(source, index)
+            parts.append(f"{_atom(_latex_to_html(numerator))}/{_atom(_latex_to_html(denominator))}")
+            continue
+        if source.startswith("\\sqrt", index):
+            index += 5
+            body, index = _latex_braces(source, index)
+            parts.append(f"√({_latex_to_html(body)})")
+            continue
+        if source.startswith("\\operatorname", index):
+            index += 13
+            name, index = _latex_braces(source, index)
+            parts.append(html.escape(name))
+            continue
+        if source.startswith("\\left", index) or source.startswith("\\right", index):
+            index += 5 if source.startswith("\\left", index) else 6
+            if index < length and source[index] in "()|[].":
+                if source[index] != ".":
+                    parts.append(source[index])
+                index += 1
+            elif source.startswith("\\{", index) or source.startswith("\\}", index):
+                parts.append(source[index + 1])
+                index += 2
+            continue
+        if source[index] == "\\":
+            end = index + 1
+            while end < length and source[end].isalpha():
+                end += 1
+            parts.append(_LATEX_WORDS.get(source[index + 1:end], ""))
+            index = end
+            continue
+        if source[index] in "_^" and index + 1 < length and source[index + 1] == "{":
+            tag = "sub" if source[index] == "_" else "sup"
+            body, index = _latex_braces(source, index + 1)
+            inner = _latex_to_html(body).replace(" ", "\uE000")
+            parts.append(f"<{tag}>{inner}</{tag}>")
+            continue
+        if source[index] == "{":
+            body, index = _latex_braces(source, index)
+            parts.append(_latex_to_html(body))
+            continue
+        if source[index] in "+-=()|,":
+            parts.append(source[index])
+            index += 1
+            continue
+        end = index + 1
+        while end < length and source[end] not in "\\{}_^+-=()|, \t":
+            end += 1
+        parts.append(html.escape(source[index:end]))
+        index = end
+    return "".join(parts)
+
+
+def _latex_braces(source: str, index: int) -> tuple[str, int]:
+    if index >= len(source) or source[index] != "{":
+        return "", index
+    depth = 0
+    for end in range(index, len(source)):
+        if source[end] == "{":
+            depth += 1
+        elif source[end] == "}":
+            depth -= 1
+            if depth == 0:
+                return source[index + 1:end], end + 1
+    return source[index + 1:], len(source)
+
+
+def _atom(fragment: str) -> str:
+    fragment = fragment.strip()
+    simple = r"[0-9A-Za-zπ.,]+(?:<su[bp]>[^<]*</su[bp]>)?|√\([^()]*\)|\|[^|]+\|"
+    if re.fullmatch(simple, fragment):
+        return fragment
+    return f"({fragment})"
+
+
+def _finish_formula(text: str) -> str:
+    text = re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r"\(\s+", "(", text)
+    text = re.sub(r"\s+\)", ")", text)
+    text = re.sub(r"(?<=[\w)>|])\s+(?=[\w(<√π|])", " · ", text)
+    return text.replace("\uE000", " ")
+
+
+def html_table(headers: list[str], rows: list[list[str]]) -> str:
+    head = "".join(f"<th>{html.escape(title)}</th>" for title in headers)
+    body = []
+    for row in rows:
+        cells = "".join(f"<td>{cell}</td>" for cell in row)
+        body.append(f"<tr>{cells}</tr>")
+    return (
+        "<div style='overflow-x:auto'>"
+        "<table border='1' cellspacing='0' cellpadding='4' "
+        "style='border-collapse:collapse;width:100%'>"
+        f"<thead><tr>{head}</tr></thead><tbody>{''.join(body)}</tbody></table></div>"
+    )
+
+
+def render_word_button(
+    model: ParsedModel | None,
+    rows: list[dict],
+    budget: Budget | None,
+    error: str,
+) -> None:
+    st.download_button(
+        "Download rapport",
+        data=word_document(model, rows, budget, error),
+        file_name=report_filename(st.session_state.get("save_name", "")),
+        mime="text/html",
+        key="word_report",
+    )
+    st.caption("Het HTML-bestand opent in Word.")
+
+
+def word_document(
+    model: ParsedModel | None,
+    rows: list[dict],
+    budget: Budget | None,
+    error: str,
+) -> str:
+    if not rows:
+        rows = [
+            {"variabele": name, **values}
+            for name, values in st.session_state.get("inputs", {}).items()
+        ]
+    formula = st.session_state.get("formule", "")
+    formula_html = latex_to_html(model.latex) if model is not None else html.escape(formula)
+    unit = str(st.session_state.get("result_unit", "")).strip()
+    sections = [
+        "<h1>Meetonzekerheid</h1>",
+        f"<p><b>Formule</b><br>{formula_html}</p>",
+    ]
+    if budget is not None:
+        suffix = f" {html.escape(unit)}" if unit else ""
+        sections.append(
+            f"<p><b>Resultaat</b><br>{quantity_html(budget.output)} = "
+            f"{html.escape(fmt(budget.nominal))} ± {html.escape(fmt(budget.expanded))}{suffix}"
+            f" (k = {html.escape(fmt(budget.coverage_factor))}, "
+            f"{html.escape(fmt(100 * budget.confidence))} %, "
+            f"ν<sub>eff</sub> = {html.escape(fmt(budget.degrees_of_freedom))})</p>"
+        )
+    elif error:
+        sections.append(f"<p><b>Resultaat</b><br>{html.escape(error)}</p>")
+    quantity_rows = [
+        [
+            quantity_html(str(row.get("variabele", ""))),
+            html.escape(str(row.get("omschrijving", "") or "")),
+            html.escape(str(row.get("waarde", "") or "")),
+            html.escape(str(row.get("eenheid", "") or "")),
+            html.escape(str(row.get("type", "") or "")),
+            html.escape(str(row.get("verdeling", "") or "")),
+            html.escape(str(row.get("onzekerheid", "") or "")),
+            html.escape(str(row.get("k", "") or "")),
+            html.escape(str(row.get("vrijheidsgraden", "") or "")),
+            html.escape(str(row.get("opmerking", "") or "")),
+        ]
+        for row in rows
+    ]
+    sections.append("<h2>Grootheden</h2>")
+    sections.append(
+        html_table(
+            ["Variabele", "Omschrijving", "Waarde", "Eenheid", "Type", "Verdeling", "Onzekerheid", "k", "Vrijheidsgraden", "Opmerking"],
+            quantity_rows,
+        )
+    )
+    if budget is not None:
+        budget_rows = [
+            [
+                quantity_html(item.name),
+                html.escape(fmt(item.nominal)),
+                html.escape(item.unit),
+                "A" if item.kind == "A" else "B",
+                html.escape(item.distribution),
+                html.escape(item.conversion),
+                html.escape(fmt(item.standard_uncertainty)),
+                html.escape(fmt(item.degrees_of_freedom)),
+                html.escape(fmt(item.sensitivity)),
+                html.escape(fmt(item.product)),
+                html.escape(f"{item.share:.1f} %".replace(".", ",")),
+                html.escape(item.comment),
+            ]
+            for item in budget.contributions
+        ]
+        sections.append("<h2>Onzekerheidsbudget</h2>")
+        sections.append(
+            html_table(
+                ["Grootheid", "Waarde", "Eenheid", "Type", "Verdeling", "Omrekening", "u", "ν", "c", "c·u", "Aandeel", "Opmerking"],
+                budget_rows,
+            )
+        )
+    body = "\n".join(sections)
+    return f"""<!DOCTYPE html>
+<html xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:w="urn:schemas-microsoft-com:office:word" xmlns="http://www.w3.org/TR/REC-html40">
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<meta name="ProgId" content="Word.Document">
+<title>Meetonzekerheid</title>
+<style>
+body {{ font-family: Calibri, Arial, sans-serif; }}
+table {{ border-collapse: collapse; }}
+td, th {{ border: 1px solid #666666; padding: 4px 6px; vertical-align: top; }}
+th {{ background: #1f4e79; color: #ffffff; }}
+</style>
+</head>
+<body>
+{body}
+</body>
+</html>
+"""
 
 
 if __name__ == "__main__":

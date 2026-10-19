@@ -17,15 +17,13 @@ import sympy
 from scipy import stats
 from sympy.parsing.sympy_parser import (
     convert_xor,
-    implicit_multiplication_application,
     parse_expr,
     standard_transformations,
 )
 
-_TRANSFORMS = standard_transformations + (
-    convert_xor,
-    implicit_multiplication_application,
-)
+# No implicit multiplication: adjacent letters are one quantity (ab, ID_first).
+# evaluate=False emits Mul, Add and Pow, and keeps the entered factor order.
+_TRANSFORMS = standard_transformations + (convert_xor,)
 
 # SymPy's default namespace treats I as the imaginary unit and E, N, beta and
 # gamma as special objects. Those names are ordinary quantities here.
@@ -34,6 +32,9 @@ _GLOBAL = {
     "Integer": sympy.Integer,
     "Float": sympy.Float,
     "Rational": sympy.Rational,
+    "Add": sympy.Add,
+    "Mul": sympy.Mul,
+    "Pow": sympy.Pow,
 }
 
 _LOCALS = {
@@ -54,6 +55,11 @@ _LOCALS = {
 _DECIMAL_COMMA = re.compile(r"(\d),(\d)")
 _PERCENT = re.compile(r"(\d+(?:\.\d+)?)\s*%")
 _NAME = re.compile(r"^[^\d\W]\w*$", re.UNICODE)
+_IDENT = r"[^\d\W]\w*"
+_SCIENTIFIC = re.compile(r"(?<![\w.])(?:\d+\.\d+|\d+)[eE][+-]?\d+")
+_MUL_DOT = re.compile(r"([\w)])\s*\.\s*([\w(])")
+_CALL = re.compile(rf"({_IDENT})\s*\(")
+_REDUNDANT_FRACTION = re.compile(r"1 \\frac\{1\}")
 
 DISTRIBUTIONS = ("Normaal", "Rechthoekig", "Driehoekig")
 
@@ -148,6 +154,40 @@ def preprocess(expression: str) -> str:
     text = _DECIMAL_COMMA.sub(r"\1.\2", text)
     text = _PERCENT.sub(r"(\1/100)", text)
     text = re.sub(r"\bln\b", "log", text)
+    return _explicit_products(text)
+
+
+def _explicit_products(text: str) -> str:
+    """Turn a multiplication dot, and a number or bracket beside a quantity, into *."""
+    protected: list[str] = []
+
+    def hold(match: re.Match[str]) -> str:
+        protected.append(match.group(0))
+        return f"@@SCI{len(protected) - 1}@@"
+
+    text = _SCIENTIFIC.sub(hold, text)
+
+    def dot(match: re.Match[str]) -> str:
+        left, right = match.group(1), match.group(2)
+        if left.isdigit() and right.isdigit():
+            return match.group(0)
+        return f"{left}*{right}"
+
+    text = _MUL_DOT.sub(dot, text)
+    text = re.sub(r"\)\s*\(", ")*(", text)
+    text = re.sub(rf"\)\s*({_IDENT})", r")*\1", text)
+    text = re.sub(r"(\d)\s*\(", r"\1*(", text)
+    text = re.sub(rf"(\d)\s*({_IDENT})", r"\1*\2", text)
+
+    def call(match: re.Match[str]) -> str:
+        name = match.group(1)
+        if name in _LOCALS and name != "pi":
+            return match.group(0)
+        return f"{name}*("
+
+    text = _CALL.sub(call, text)
+    for index, token in enumerate(protected):
+        text = text.replace(f"@@SCI{index}@@", token)
     return text
 
 
@@ -161,10 +201,15 @@ def parse_expression(expression: str) -> sympy.Expr:
             local_dict=_LOCALS,
             global_dict=_GLOBAL,
             transformations=_TRANSFORMS,
-            evaluate=True,
+            evaluate=False,
         )
     except Exception as exc:
         raise FormulaError(f"ongeldige formule: {exc}") from exc
+
+
+def _presentation_latex(expression: sympy.Expr) -> str:
+    """Latex that keeps the entered order and hides a duplicated numerator 1."""
+    return _REDUNDANT_FRACTION.sub(r"\\frac{1}", sympy.latex(expression, order="none"))
 
 
 def parse_model(formula: str) -> ParsedModel:
@@ -193,12 +238,12 @@ def parse_model(formula: str) -> ParsedModel:
         raise FormulaError("de uitkomst mag niet ook in het rechterlid staan")
 
     names = _ordered_quantities(rhs_source, expression)
-    equation = sympy.Eq(output_symbol, expression)
+    equation = sympy.Eq(output_symbol, expression, evaluate=False)
     return ParsedModel(
         output=output,
         expression=expression,
         quantities=names,
-        latex=sympy.latex(equation),
+        latex=_presentation_latex(equation),
     )
 
 
