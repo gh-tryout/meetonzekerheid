@@ -1,7 +1,8 @@
 """GUM uncertainty propagation for one explicit measurement model.
 
 The calculation follows the first-order law of propagation and the
-Welch–Satterthwaite formula. Input quantities are treated as uncorrelated.
+Welch–Satterthwaite formula. A Monte Carlo option draws the same
+uncorrelated inputs and evaluates the model on those draws.
 """
 
 from __future__ import annotations
@@ -50,7 +51,9 @@ _LOCALS = {
     "exp": sympy.exp,
     "abs": sympy.Abs,
     "pi": sympy.pi,
+    "e": sympy.E,
 }
+_CONSTANTS = frozenset({"pi", "e"})
 
 _DECIMAL_COMMA = re.compile(r"(\d),(\d)")
 _PERCENT = re.compile(r"(\d+(?:\.\d+)?)\s*%")
@@ -84,6 +87,7 @@ class TypeASummary:
     standard_uncertainty: float
     degrees_of_freedom: float
     pooled: bool = False
+    direct: bool = False
 
 
 @dataclass
@@ -94,7 +98,7 @@ class QuantityInput:
     kind: str = "B"
     distribution: str = "Normaal"
     uncertainty_expression: str = ""
-    coverage_factor: float = 1.0
+    coverage_factor: float = 2.0
     degrees_of_freedom: float = math.inf
     comment: str = ""
     measurements: list[float] | None = None
@@ -102,6 +106,8 @@ class QuantityInput:
     use_mean_as_value: bool = True
     pooled_stdev: float | None = None
     pooled_degrees_of_freedom: float | None = None
+    direct_stdev: float | None = None
+    direct_count: int | None = None
 
 
 @dataclass
@@ -138,6 +144,22 @@ class Budget:
         if self.nominal == 0:
             return None
         return abs(self.combined / self.nominal)
+
+
+@dataclass
+class MonteCarloResult:
+    output: str
+    trials: int
+    accepted: int
+    seed: int
+    mean: float
+    standard_uncertainty: float
+    low: float
+    high: float
+    confidence: float
+    edges: list[float] = field(default_factory=list)
+    counts: list[int] = field(default_factory=list)
+    heavy_tail: bool = False
 
 
 def preprocess(expression: str) -> str:
@@ -181,7 +203,7 @@ def _explicit_products(text: str) -> str:
 
     def call(match: re.Match[str]) -> str:
         name = match.group(1)
-        if name in _LOCALS and name != "pi":
+        if name in _LOCALS and name not in _CONSTANTS:
             return match.group(0)
         return f"{name}*("
 
@@ -343,6 +365,22 @@ def summarize_type_a(
         stdev=stdev,
         standard_uncertainty=standard,
         degrees_of_freedom=float(count - 1),
+    )
+
+
+def summarize_direct_stdev(stdev: float, count: int) -> TypeASummary:
+    """Standard uncertainty from an entered standard deviation and observation count."""
+    if not math.isfinite(stdev) or stdev < 0:
+        raise FormulaError("de standaardafwijking moet 0 of groter zijn")
+    if count < 1:
+        raise FormulaError("het aantal waarnemingen moet minstens 1 zijn")
+    return TypeASummary(
+        count=count,
+        mean=0.0,
+        stdev=float(stdev),
+        standard_uncertainty=float(stdev) / math.sqrt(count),
+        degrees_of_freedom=float(count - 1) if count >= 2 else math.inf,
+        direct=True,
     )
 
 
@@ -586,6 +624,11 @@ def _resolve_nominals(names: list[str], by_name: dict[str, QuantityInput]) -> di
 
 
 def _type_a_summary(item: QuantityInput) -> TypeASummary:
+    if item.direct_stdev is not None and item.direct_count is not None:
+        try:
+            return summarize_direct_stdev(item.direct_stdev, item.direct_count)
+        except FormulaError as exc:
+            raise FormulaError(f"{exc} ({item.name})") from exc
     if not item.measurements:
         raise FormulaError(f"voer meetwaarden in voor {item.name}")
     try:
@@ -617,7 +660,9 @@ def _standard_uncertainty(
 ) -> tuple[float, float, str, str]:
     if item.kind == "A":
         summary = _type_a_summary(item)
-        if summary.pooled and item.pooled_stdev is not None:
+        if summary.direct and summary.stdev is not None:
+            conversion = f"s/√n = {_plain(summary.stdev)}/√{summary.count}"
+        elif summary.pooled and item.pooled_stdev is not None:
             conversion = f"s_p/√n = {_plain(item.pooled_stdev)}/√{summary.count}"
         elif item.uncertainty_of_mean and summary.stdev is not None:
             conversion = f"s/√n = {_plain(summary.stdev)}/√{summary.count}"
@@ -696,6 +741,111 @@ def _coverage_factor(confidence: float, degrees_of_freedom: float) -> float:
     if math.isinf(degrees_of_freedom):
         return float(stats.norm.ppf(probability))
     return float(stats.t.ppf(probability, degrees_of_freedom))
+
+
+def monte_carlo(
+    model: ParsedModel,
+    quantities: list[QuantityInput],
+    confidence: float = 0.95,
+    trials: int = 100_000,
+    seed: int = 1,
+) -> MonteCarloResult:
+    """Propagate independent draws through the model and summarize the output."""
+    if not 0 < confidence < 1:
+        raise FormulaError("het betrouwbaarheidsniveau moet tussen 0 en 1 liggen")
+    if trials < 1_000 or trials > 1_000_000:
+        raise FormulaError("het aantal trekkingen moet tussen 1 000 en 1 000 000 liggen")
+    if seed < 0 or seed > 2**32 - 1:
+        raise FormulaError("de startwaarde moet tussen 0 en 4294967295 liggen")
+
+    by_name = {item.name: item for item in quantities}
+    missing = [name for name in model.quantities if name not in by_name]
+    if missing:
+        raise FormulaError("ontbrekende grootheden: " + ", ".join(missing))
+
+    nominals = _resolve_nominals(model.quantities, by_name)
+    rng = np.random.default_rng(int(seed))
+    columns: list[np.ndarray] = []
+    heavy_tail = False
+    for name in model.quantities:
+        item = by_name[name]
+        standard, dof, _, _ = _standard_uncertainty(item, nominals)
+        if (item.kind == "A" or item.distribution == "Normaal") and math.isfinite(dof) and dof <= 2:
+            heavy_tail = True
+        columns.append(_draw_quantity(rng, item, nominals[name], standard, dof, trials))
+
+    values = _evaluate_draws(model, columns, trials)
+    accepted = values[np.isfinite(values)]
+    if accepted.size < 2:
+        raise FormulaError("te weinig geldige trekkingen om een onzekerheid te bepalen")
+
+    low_probability = (1 - confidence) / 2
+    low, high = np.quantile(accepted, [low_probability, 1 - low_probability])
+    edges, counts = _output_histogram(accepted)
+    return MonteCarloResult(
+        output=model.output,
+        trials=trials,
+        accepted=int(accepted.size),
+        seed=int(seed),
+        mean=float(np.mean(accepted)),
+        standard_uncertainty=float(np.std(accepted, ddof=1)),
+        low=float(low),
+        high=float(high),
+        confidence=confidence,
+        edges=edges,
+        counts=counts,
+        heavy_tail=heavy_tail,
+    )
+
+
+def _draw_quantity(
+    rng: np.random.Generator,
+    item: QuantityInput,
+    center: float,
+    standard: float,
+    degrees_of_freedom: float,
+    trials: int,
+) -> np.ndarray:
+    """Draw one input from the distribution already used in the GUM budget."""
+    if item.kind == "A" or item.distribution == "Normaal":
+        if standard == 0:
+            return np.full(trials, center)
+        if math.isfinite(degrees_of_freedom) and degrees_of_freedom < 1_000_000:
+            return center + standard * rng.standard_t(degrees_of_freedom, size=trials)
+        return rng.normal(center, standard, size=trials)
+
+    half_width = standard * math.sqrt(3 if item.distribution == "Rechthoekig" else 6)
+    if half_width == 0:
+        return np.full(trials, center)
+    if item.distribution == "Rechthoekig":
+        return rng.uniform(center - half_width, center + half_width, size=trials)
+    return rng.triangular(center - half_width, center, center + half_width, size=trials)
+
+
+def _evaluate_draws(model: ParsedModel, columns: list[np.ndarray], trials: int) -> np.ndarray:
+    if columns:
+        symbols = [sympy.Symbol(name) for name in model.quantities]
+        function = sympy.lambdify(symbols, model.expression, modules=["numpy"])
+        output = function(*columns)
+    else:
+        output = _as_float(model.expression)
+    values = np.asarray(output)
+    if np.iscomplexobj(values):
+        imag = np.abs(np.imag(values))
+        values = np.where(imag <= 1e-9 * np.maximum(1.0, np.abs(np.real(values))), np.real(values), np.nan)
+    values = np.asarray(values, dtype=float).reshape(-1)
+    if values.size == 1 and trials > 1:
+        values = np.full(trials, float(values[0]))
+    if values.size != trials:
+        raise FormulaError("de formule geeft niet één uitkomst per trekking")
+    return values
+
+
+def _output_histogram(values: np.ndarray, bins: int = 40) -> tuple[list[float], list[int]]:
+    if float(np.max(values) - np.min(values)) == 0:
+        return [], []
+    counts, edges = np.histogram(values, bins=bins)
+    return [float(edge) for edge in edges], [int(count) for count in counts]
 
 
 def _numeric_cells(frame: pd.DataFrame) -> int:

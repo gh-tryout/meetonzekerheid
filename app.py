@@ -18,15 +18,18 @@ from engine import (
     DISTRIBUTIONS,
     Budget,
     FormulaError,
+    MonteCarloResult,
     ParsedModel,
     QuantityInput,
     evaluate,
+    monte_carlo,
     numeric_column,
     parse_model,
     parse_number_series,
     range_points,
     read_measurement_table,
     richest_column,
+    summarize_direct_stdev,
     summarize_type_a,
     sweep,
 )
@@ -51,10 +54,10 @@ EXAMPLE_INPUTS = {
         "omschrijving": "spanning",
         "waarde": "10",
         "eenheid": "V",
-        "type": "Type B",
+        "type": "B",
         "verdeling": "Normaal",
         "onzekerheid": "0,1",
-        "k": "1",
+        "k": "2",
         "vrijheidsgraden": "∞",
         "opmerking": "spanning",
     },
@@ -62,10 +65,10 @@ EXAMPLE_INPUTS = {
         "omschrijving": "stroom",
         "waarde": "2",
         "eenheid": "A",
-        "type": "Type B",
+        "type": "B",
         "verdeling": "Normaal",
         "onzekerheid": "0,5%",
-        "k": "1",
+        "k": "2",
         "vrijheidsgraden": "∞",
         "opmerking": "stroom, 0,5 procent van de waarde",
     },
@@ -73,8 +76,8 @@ EXAMPLE_INPUTS = {
 
 SAMPLE_CSV = "meting\n1,98\n2,01\n1,99\n2,02\n2,00\n1,97\n2,03\n"
 
-# Omschrijving is about 20% of the row: 2.79 / (11.15 + 2.79).
-QUANTITY_WIDTHS = [1.05, 2.79, 1.35, 0.85, 1.1, 1.2, 1.7, 0.65, 1.35, 1.9]
+# Omschrijving and opmerking are each about 20% of the row: 3.08 / 15.41.
+QUANTITY_WIDTHS = [1.05, 3.08, 1.35, 0.85, 1.1, 1.2, 1.7, 0.65, 1.35, 3.08]
 QUANTITY_HEADERS = [
     "Variabele",
     "Omschrijving",
@@ -97,6 +100,7 @@ def main() -> None:
         "Voer een meetmodel in. Elke grootheid uit de formule krijgt een regel "
         "voor de waarde, het type, de verdeling en de onzekerheid. "
         "De gecombineerde standaardonzekerheid wordt berekend met de eerstegraads GUM-methode. "
+        "Daarnaast kan dezelfde invoer met Monte Carlo worden doorgerekend. "
         "Grootheden worden als ongecorreleerd behandeld."
     )
     render_storage()
@@ -108,7 +112,8 @@ def main() -> None:
     rows = render_quantity_table(model)
     render_type_a(rows)
     budget, error = render_budget(model, rows)
-    render_word_button(model, rows, budget, error)
+    monte_carlo_result = render_monte_carlo(model, rows, budget)
+    render_word_button(model, rows, budget, error, monte_carlo_result)
     render_sweep(model, rows)
 
 
@@ -174,7 +179,8 @@ def render_model() -> None:
         "Een subscript volgt op een liggend streepje, zoals U_1 of DP_max. "
         "Een punt of een ster tussen grootheden is een vermenigvuldiging, zoals a.b of U*I. "
         "Een getal direct voor een grootheid is ook een vermenigvuldiging, zoals 2U. "
-        "Een punt tussen cijfers blijft een decimaalteken, zoals 1.5. Machten schrijf je met ^."
+        "Een punt tussen cijfers blijft een decimaalteken, zoals 1.5. Machten schrijf je met ^. "
+        "e is het getal 2,718… en pi het getal 3,141…."
     )
 
     formula = st.session_state.formule.strip()
@@ -213,9 +219,10 @@ def render_quantity_table(model: ParsedModel) -> list[dict]:
         "Waarde en onzekerheid mogen een getal zijn of een formule van de grootheden, "
         "bijvoorbeeld `2*U` of `0,1%*U + 0,02`. "
         "`0,5%` als onzekerheid betekent 0,5 procent van de nominale waarde van díe grootheid. "
-        "Bij een normale verdeling is de ingevulde onzekerheid de uitgebreide onzekerheid en deelt het programma door k. "
+        "k geldt alleen bij een normale verdeling en staat standaard op 2. "
+        "De ingevulde onzekerheid wordt dan door k gedeeld. "
         "Bij rechthoekig en driehoekig vul je de halfbreedte a in; de standaardonzekerheid wordt a/√3 of a/√6. "
-        "Bij Type A worden waarde, onzekerheid en vrijheidsgraden berekend. Die cellen zijn blauw en niet aan te passen."
+        "Bij A worden onzekerheid en vrijheidsgraden berekend. Die cellen zijn blauw en niet aan te passen."
     )
     header = st.columns(QUANTITY_WIDTHS, gap="small", vertical_alignment="bottom")
     for column, title in zip(header, QUANTITY_HEADERS):
@@ -231,19 +238,20 @@ def render_quantity_table(model: ParsedModel) -> list[dict]:
 
 def render_quantity_row(name: str) -> dict:
     summary = None
-    is_type_a = st.session_state[field_key(name, "type")] == "Type A"
-    use_mean = bool(st.session_state.get(f"mean_{name}", True))
+    is_type_a = canonical_type(st.session_state[field_key(name, "type")]) == "A"
+    method = type_a_method(name)
+    use_mean = method != "s" and bool(st.session_state.get(f"mean_{name}", True))
     if is_type_a:
         summary, _error = type_a_computation(name)
     locked = calculated_fields(summary, use_mean)
-    cells = st.columns(QUANTITY_WIDTHS, gap="small", vertical_alignment="center")
+    cells = st.columns(QUANTITY_WIDTHS, gap="small", vertical_alignment="top")
     cells[0].markdown(
         f"<div style='padding:8px 0'>{quantity_html(name)}</div>",
         unsafe_allow_html=True,
     )
     displayed = {"variabele": name}
     fields = [
-        ("omschrijving", "Omschrijving", "text"),
+        ("omschrijving", "Omschrijving", "area"),
         ("waarde", "Waarde", "text"),
         ("eenheid", "Eenheid", "text"),
         ("type", "Type", "type"),
@@ -251,18 +259,28 @@ def render_quantity_row(name: str) -> dict:
         ("onzekerheid", "Onzekerheid of halfbreedte", "text"),
         ("k", "k", "text"),
         ("vrijheidsgraden", "Vrijheidsgraden", "text"),
-        ("opmerking", "Opmerking", "text"),
+        ("opmerking", "Opmerking", "area"),
     ]
     for cell, (column, label, kind) in zip(cells[1:], fields):
         with cell:
             if column in locked and summary is not None:
                 value = calculated_text(summary, column)
                 calculated_cell(value)
+            elif column == "k" and not k_is_editable(name):
+                locked_cell("—")
+                value = st.session_state.get(field_key(name, column), "2")
             else:
                 if kind == "type":
-                    value = st.selectbox(label, ["Type A", "Type B"], key=field_key(name, column), label_visibility="collapsed")
+                    value = st.selectbox(label, ["A", "B"], key=field_key(name, column), label_visibility="collapsed")
                 elif kind == "distribution":
                     value = st.selectbox(label, list(DISTRIBUTIONS), key=field_key(name, column), label_visibility="collapsed")
+                elif kind == "area":
+                    value = st.text_area(
+                        label,
+                        key=field_key(name, column),
+                        label_visibility="collapsed",
+                        height=88,
+                    )
                 else:
                     value = st.text_input(label, key=field_key(name, column), label_visibility="collapsed")
                 st.session_state.setdefault("quantity_typed", {}).setdefault(name, {})[column] = (
@@ -270,6 +288,26 @@ def render_quantity_row(name: str) -> dict:
                 )
         displayed[column] = "" if value is None else str(value)
     return displayed
+
+
+def canonical_type(value) -> str:
+    text = str(value).strip().lower().replace("type", "").strip()
+    return "A" if text == "a" else "B"
+
+
+def k_is_editable(name: str) -> bool:
+    return (
+        canonical_type(st.session_state.get(field_key(name, "type"), "B")) == "B"
+        and st.session_state.get(field_key(name, "verdeling"), "Normaal") == "Normaal"
+    )
+
+
+def locked_cell(text: str) -> None:
+    st.html(
+        "<div style='background:#f4f7fb;color:#6b7280;border:1px solid #e5e7eb;"
+        "border-radius:8px;padding:7px 12px;min-height:38px;line-height:22px'>"
+        f"{html.escape(text)}</div>"
+    )
 
 
 def calculated_fields(summary, use_mean: bool) -> set[str]:
@@ -299,70 +337,118 @@ def calculated_cell(text: str) -> None:
 
 
 def render_type_a(rows: list[dict]) -> None:
-    selected = [row for row in rows if str(row["type"]).endswith("A")]
+    selected = [row for row in rows if canonical_type(row["type"]) == "A"]
     if not selected:
         return
-    st.subheader("Type A-meetwaarden")
-    st.download_button(
-        "Download voorbeeld-CSV",
-        SAMPLE_CSV,
-        file_name="meetwaarden.csv",
-        mime="text/csv",
-    )
+    st.subheader("Invoer bij A")
     st.caption(
-        "Typ de meetwaarden, of laad ze uit een CSV. "
-        "Een decimale komma mag. Een pooled estimate is optioneel: dan is de standaardonzekerheid s_p/√n."
+        "Meetwaarden zijn optioneel. Kies een standaardafwijking met het aantal waarnemingen, "
+        "typ de meetwaarden, of laad een bestand. "
+        "Een pooled estimate is bij meetwaarden en bij een bestand optioneel: "
+        "dan is de standaardonzekerheid s_p gedeeld door de wortel van het aantal waarnemingen."
     )
     for row in selected:
         render_type_a_quantity(str(row["variabele"]))
 
 
+TYPE_A_METHODS = ("Standaardafwijking", "Meetwaarden", "Bestand")
+_METHOD_CODE = {"Standaardafwijking": "s", "Meetwaarden": "reeks", "Bestand": "bestand"}
+_METHOD_LABEL = {code: label for label, code in _METHOD_CODE.items()}
+
+
+def type_a_method(name: str) -> str:
+    label = str(st.session_state.get(f"method_{name}", "Standaardafwijking"))
+    return _METHOD_CODE.get(label, "s")
+
+
 def render_type_a_quantity(name: str) -> None:
     with st.container(border=True):
-        st.markdown(f"**{name}**")
-        apply_csv_upload(name)
-        st.text_area(
-            "Meetwaarden",
-            key=f"series_{name}",
-            height=140,
-            placeholder="1,98\n2,01\n1,99",
-            help="Eén getal per regel, of gescheiden door spaties of puntkomma's.",
-        )
-        pooled_col, dof_col = st.columns(2)
-        with pooled_col:
-            st.text_input("Pooled estimate s_p", key=f"pooled_{name}", placeholder="optioneel")
-        with dof_col:
-            st.text_input("Vrijheidsgraden van de pooled estimate", key=f"pooled_dof_{name}")
-        st.button("Wis meetwaarden", key=f"clear_series_{name}", on_click=clear_series, args=(name,))
-        summary, error = type_a_computation(name)
-        if error:
-            st.error(error)
-        use_mean = st.checkbox("Gebruik het gemiddelde als nominale waarde", value=True, key=f"mean_{name}")
-        pooled_active = bool(str(st.session_state.get(f"pooled_{name}", "")).strip())
-        if pooled_active:
-            st.caption("De standaardonzekerheid is s_p gedeeld door de wortel van het aantal waarnemingen.")
+        st.markdown(f"**{quantity_html(name)}**", unsafe_allow_html=True)
+        st.radio("Invoer", TYPE_A_METHODS, key=f"method_{name}", horizontal=True)
+        method = type_a_method(name)
+        if method == "s":
+            render_direct_stdev(name)
+        elif method == "bestand":
+            render_series_input(name, from_file=True)
         else:
-            st.checkbox(
-                "Standaardonzekerheid van het gemiddelde (s/√n). Uitvinken gebruikt s zelf.",
-                value=True,
-                key=f"sqrtn_{name}",
-            )
-        stored = st.session_state.measurements.setdefault(name, {})
-        stored["use_mean"] = use_mean
-        stored["of_mean"] = bool(st.session_state.get(f"sqrtn_{name}", True))
-        if summary is None:
-            if not error:
-                st.info("Voer minstens twee meetwaarden in, of één meetwaarde samen met een pooled estimate.")
-            return
-        values = stored.get("values") or []
-        metrics = st.columns(5)
-        metrics[0].metric("n", f"{summary.count}")
-        metrics[1].metric("gemiddelde", fmt(summary.mean))
-        metrics[2].metric("standaardafwijking s", "—" if summary.stdev is None else fmt(summary.stdev))
-        metrics[3].metric("standaardonzekerheid u", fmt(summary.standard_uncertainty))
-        metrics[4].metric("vrijheidsgraden", fmt(summary.degrees_of_freedom))
-        if values:
-            st.line_chart(pd.DataFrame({"meetwaarde": values}), height=180)
+            render_series_input(name, from_file=False)
+
+
+def render_direct_stdev(name: str) -> None:
+    left, right = st.columns(2)
+    with left:
+        st.text_input("Standaardafwijking s", key=f"stdev_{name}")
+    with right:
+        st.text_input("Aantal waarnemingen", key=f"count_{name}")
+    st.caption("De standaardonzekerheid is de standaardafwijking gedeeld door de wortel van het aantal waarnemingen.")
+    summary, error = type_a_computation(name)
+    if error:
+        st.error(error)
+        return
+    if summary is None:
+        return
+    metrics = st.columns(4)
+    metrics[0].metric("n", f"{summary.count}")
+    metrics[1].metric("standaardafwijking s", fmt(summary.stdev or 0))
+    metrics[2].metric("standaardonzekerheid u", fmt(summary.standard_uncertainty))
+    metrics[3].metric("vrijheidsgraden", fmt(summary.degrees_of_freedom))
+
+
+def render_series_input(name: str, from_file: bool) -> None:
+    if from_file:
+        st.download_button(
+            "Download voorbeeld-CSV",
+            SAMPLE_CSV,
+            file_name="meetwaarden.csv",
+            mime="text/csv",
+            key=f"sample_csv_{name}",
+        )
+        apply_csv_upload(name)
+        filename = str(st.session_state.measurements.get(name, {}).get("filename") or "")
+        if filename:
+            st.caption(f"Bestand: {filename}")
+    st.text_area(
+        "Meetwaarden",
+        key=f"series_{name}",
+        height=140,
+        placeholder="1,98\n2,01\n1,99",
+        help="Eén getal per regel, of gescheiden door spaties of puntkomma's.",
+    )
+    pooled_col, dof_col = st.columns(2)
+    with pooled_col:
+        st.text_input("Pooled estimate s_p", key=f"pooled_{name}", placeholder="optioneel")
+    with dof_col:
+        st.text_input("Vrijheidsgraden van de pooled estimate", key=f"pooled_dof_{name}")
+    st.button("Wis meetwaarden", key=f"clear_series_{name}", on_click=clear_series, args=(name,))
+    summary, error = type_a_computation(name)
+    if error:
+        st.error(error)
+    use_mean = st.checkbox("Gebruik het gemiddelde als nominale waarde", value=True, key=f"mean_{name}")
+    pooled_active = bool(str(st.session_state.get(f"pooled_{name}", "")).strip())
+    if pooled_active:
+        st.caption("De standaardonzekerheid is s_p gedeeld door de wortel van het aantal waarnemingen.")
+    else:
+        st.checkbox(
+            "Standaardonzekerheid van het gemiddelde (s/√n). Uitvinken gebruikt s zelf.",
+            value=True,
+            key=f"sqrtn_{name}",
+        )
+    stored = st.session_state.measurements.setdefault(name, {})
+    stored["use_mean"] = use_mean
+    stored["of_mean"] = bool(st.session_state.get(f"sqrtn_{name}", True))
+    if summary is None:
+        if not error:
+            st.info("Voer minstens twee meetwaarden in, of één meetwaarde samen met een pooled estimate.")
+        return
+    values = stored.get("values") or []
+    metrics = st.columns(5)
+    metrics[0].metric("n", f"{summary.count}")
+    metrics[1].metric("gemiddelde", fmt(summary.mean))
+    metrics[2].metric("standaardafwijking s", "—" if summary.stdev is None else fmt(summary.stdev))
+    metrics[3].metric("standaardonzekerheid u", fmt(summary.standard_uncertainty))
+    metrics[4].metric("vrijheidsgraden", fmt(summary.degrees_of_freedom))
+    if values:
+        st.line_chart(pd.DataFrame({"meetwaarde": values}), height=180)
 
 
 def apply_csv_upload(name: str) -> None:
@@ -422,14 +508,20 @@ def clear_series(name: str) -> None:
     st.session_state[f"series_{name}"] = ""
     st.session_state[f"pooled_{name}"] = ""
     st.session_state[f"pooled_dof_{name}"] = ""
+    st.session_state[f"stdev_{name}"] = ""
+    st.session_state[f"count_{name}"] = ""
     stored = st.session_state.measurements.get(name, {})
     for key in ("data", "values", "upload_token", "filename", "column", "applied_column", "error"):
         stored.pop(key, None)
     stored["series"] = ""
     stored["pooled"] = ""
     stored["pooled_dof"] = ""
+    stored["stdev"] = ""
+    stored["count"] = ""
     stored["pooled_stdev"] = None
     stored["pooled_degrees"] = None
+    stored["direct_stdev"] = None
+    stored["direct_count"] = None
     st.session_state.measurements[name] = stored
     st.session_state.csv_generation[name] = st.session_state.csv_generation.get(name, 0) + 1
 
@@ -447,7 +539,7 @@ def ensure_quantity_fields(name: str) -> None:
         "type": saved.get("type", "Type B"),
         "verdeling": saved.get("verdeling", "Normaal"),
         "onzekerheid": saved.get("onzekerheid", ""),
-        "k": saved.get("k", "1") or "1",
+        "k": saved.get("k", "2") or "2",
         "vrijheidsgraden": saved.get("vrijheidsgraden", "∞") or "∞",
         "opmerking": saved.get("opmerking", ""),
     }
@@ -460,8 +552,9 @@ def ensure_quantity_fields(name: str) -> None:
         key = field_key(name, column)
         if key not in st.session_state:
             st.session_state[key] = typed[column]
-    if st.session_state[field_key(name, "type")] not in ("Type A", "Type B"):
-        st.session_state[field_key(name, "type")] = "Type B"
+    type_key = field_key(name, "type")
+    if st.session_state.get(type_key) not in ("A", "B"):
+        st.session_state[type_key] = canonical_type(st.session_state.get(type_key, saved.get("type", "B")))
     if st.session_state[field_key(name, "verdeling")] not in DISTRIBUTIONS:
         st.session_state[field_key(name, "verdeling")] = "Normaal"
     stored = st.session_state.measurements.get(name, {})
@@ -475,42 +568,86 @@ def ensure_quantity_fields(name: str) -> None:
             st.session_state[series_key] = ""
     st.session_state.setdefault(f"pooled_{name}", str(stored.get("pooled") or ""))
     st.session_state.setdefault(f"pooled_dof_{name}", str(stored.get("pooled_dof") or ""))
+    st.session_state.setdefault(f"stdev_{name}", str(stored.get("stdev") or ""))
+    st.session_state.setdefault(f"count_{name}", str(stored.get("count") or ""))
     st.session_state.setdefault(f"mean_{name}", bool(stored.get("use_mean", True)))
     st.session_state.setdefault(f"sqrtn_{name}", bool(stored.get("of_mean", True)))
+    if f"method_{name}" not in st.session_state:
+        stored_method = str(stored.get("method") or "")
+        if stored_method in _METHOD_LABEL:
+            label = _METHOD_LABEL[stored_method]
+        elif stored.get("filename"):
+            label = "Bestand"
+        elif stored.get("series") or stored.get("values"):
+            label = "Meetwaarden"
+        else:
+            label = "Standaardafwijking"
+        st.session_state[f"method_{name}"] = label
 
 
 def type_a_computation(name: str):
     stored = st.session_state.measurements.setdefault(name, {})
+    method = type_a_method(name)
+    stored["method"] = method
     try:
-        values = parse_number_series(str(st.session_state.get(f"series_{name}", "")))
-        pooled_text = str(st.session_state.get(f"pooled_{name}", ""))
-        dof_text = str(st.session_state.get(f"pooled_dof_{name}", ""))
-        pooled = optional_number(pooled_text, f"de pooled estimate van {name}")
-        pooled_dof = optional_number(dof_text, f"de vrijheidsgraden van de pooled estimate van {name}")
-        if pooled is None:
-            pooled_dof = None
-        elif pooled_dof is None:
-            raise FormulaError(f"vul de vrijheidsgraden van de pooled estimate van {name} in")
-        of_mean = bool(st.session_state.get(f"sqrtn_{name}", True))
-        summary = None
-        if values:
-            summary = summarize_type_a(values, True if pooled is not None else of_mean, pooled, pooled_dof)
+        if method == "s":
+            summary = _direct_type_a_summary(name, stored)
+        else:
+            summary = _series_type_a_summary(name, stored)
     except FormulaError as exc:
         stored["error"] = str(exc)
-        stored["values"] = []
-        stored["pooled_stdev"] = None
-        stored["pooled_degrees"] = None
+        if method == "s":
+            stored["direct_stdev"] = None
+            stored["direct_count"] = None
+        else:
+            stored["values"] = []
+            stored["pooled_stdev"] = None
+            stored["pooled_degrees"] = None
         return None, str(exc)
+    stored["use_mean"] = method != "s" and bool(st.session_state.get(f"mean_{name}", True))
+    stored["of_mean"] = bool(st.session_state.get(f"sqrtn_{name}", True))
+    stored["error"] = None
+    return summary, None
+
+
+def _direct_type_a_summary(name: str, stored: dict):
+    stdev_text = str(st.session_state.get(f"stdev_{name}", ""))
+    count_text = str(st.session_state.get(f"count_{name}", ""))
+    stdev = optional_number(stdev_text, f"de standaardafwijking van {name}")
+    count = optional_count(count_text, f"het aantal waarnemingen van {name}")
+    stored["stdev"] = stdev_text.strip()
+    stored["count"] = count_text.strip()
+    if stdev is None or count is None:
+        raise FormulaError(f"vul de standaardafwijking en het aantal waarnemingen van {name} in")
+    summary = summarize_direct_stdev(stdev, count)
+    stored["direct_stdev"] = stdev
+    stored["direct_count"] = count
+    return summary
+
+
+def _series_type_a_summary(name: str, stored: dict):
+    values = parse_number_series(str(st.session_state.get(f"series_{name}", "")))
+    pooled_text = str(st.session_state.get(f"pooled_{name}", ""))
+    dof_text = str(st.session_state.get(f"pooled_dof_{name}", ""))
+    pooled = optional_number(pooled_text, f"de pooled estimate van {name}")
+    pooled_dof = optional_number(dof_text, f"de vrijheidsgraden van de pooled estimate van {name}")
+    if pooled is None:
+        pooled_dof = None
+    elif pooled_dof is None:
+        raise FormulaError(f"vul de vrijheidsgraden van de pooled estimate van {name} in")
+    of_mean = bool(st.session_state.get(f"sqrtn_{name}", True))
+    summary = summarize_type_a(values, True if pooled is not None else of_mean, pooled, pooled_dof) if values else None
+    if summary is None:
+        raise FormulaError(f"voer meetwaarden in voor {name}")
     stored["series"] = str(st.session_state.get(f"series_{name}", ""))
     stored["pooled"] = pooled_text.strip()
     stored["pooled_dof"] = dof_text.strip()
     stored["values"] = values
     stored["pooled_stdev"] = pooled
     stored["pooled_degrees"] = pooled_dof
-    stored["use_mean"] = bool(st.session_state.get(f"mean_{name}", True))
-    stored["of_mean"] = bool(st.session_state.get(f"sqrtn_{name}", True))
-    stored["error"] = None
-    return summary, None
+    stored["direct_stdev"] = None
+    stored["direct_count"] = None
+    return summary
 
 
 def optional_number(text: str, label: str) -> float | None:
@@ -526,6 +663,15 @@ def optional_number(text: str, label: str) -> float | None:
     return value
 
 
+def optional_count(text: str, label: str) -> int | None:
+    number = optional_number(text, label)
+    if number is None:
+        return None
+    if number < 1 or abs(number - round(number)) > 1e-9:
+        raise FormulaError(f"{label} moet een geheel getal van minstens 1 zijn")
+    return int(round(number))
+
+
 def assign_quantity_widgets(inputs: dict) -> None:
     typed_all: dict = {}
     for name, values in inputs.items():
@@ -535,6 +681,10 @@ def assign_quantity_widgets(inputs: dict) -> None:
                 continue
             raw = values.get(column, "")
             text = "" if raw is None else str(raw)
+            if column == "type":
+                text = canonical_type(text)
+            if column == "k" and not text:
+                text = "2"
             st.session_state[field_key(name, column)] = text
             typed[column] = text
         typed_all[name] = typed
@@ -552,7 +702,7 @@ def clear_type_a_widgets() -> None:
     for key in list(st.session_state.keys()):
         if key == "csv_generation":
             continue
-        if key.startswith(("series_", "pooled_", "mean_", "sqrtn_", "csv_", "col_", "clear_series_")):
+        if key.startswith(("series_", "pooled_", "mean_", "sqrtn_", "csv_", "col_", "clear_series_", "method_", "stdev_", "count_", "sample_csv_")):
             st.session_state.pop(key, None)
 
 
@@ -638,6 +788,192 @@ De dekkingsfactor k is het tweezijdige kwantiel van de t-verdeling met die vrijh
 Bij oneindig veel vrijheidsgraden is dat het normale kwantiel.
 """
         )
+
+
+def render_monte_carlo(model: ParsedModel, rows: list[dict], budget: Budget | None) -> MonteCarloResult | None:
+    st.subheader("Monte Carlo")
+    enabled = st.checkbox("Monte Carlo berekenen", key="mc_enabled")
+    st.caption(
+        "Extra berekening naast het GUM-budget. Elke grootheid wordt getrokken uit de gekozen verdeling, "
+        "en de formule wordt voor elke trekking uitgerekend. "
+        "Het gemiddelde, de standaardafwijking en het interval komen uit die uitkomsten."
+    )
+    if not enabled:
+        return None
+    if budget is None:
+        st.caption("Monte Carlo start zodra het onzekerheidsbudget berekend kan worden.")
+        return None
+    choice, seed_box = st.columns(2)
+    with choice:
+        trials = st.selectbox(
+            "Aantal trekkingen",
+            [10_000, 100_000, 1_000_000],
+            index=1,
+            format_func=lambda value: f"{value:,}".replace(",", "."),
+            key="mc_trials",
+        )
+    with seed_box:
+        seed = int(st.number_input("Startwaarde", min_value=0, max_value=2**32 - 1, value=1, step=1, key="mc_seed"))
+    st.caption("Dezelfde startwaarde geeft dezelfde trekking. Het betrouwbaarheidsniveau is dat van het budget.")
+    try:
+        quantities = [quantity_from_row(row) for row in rows]
+        result = cached_monte_carlo(
+            st.session_state.formule,
+            _quantity_signature(quantities),
+            float(st.session_state.confidence),
+            int(trials),
+            seed,
+        )
+    except FormulaError as exc:
+        st.error(str(exc))
+        return None
+    show_monte_carlo(result, budget)
+    return result
+
+
+@st.cache_data(show_spinner="Monte Carlo berekenen…")
+def cached_monte_carlo(formula: str, signature: str, confidence: float, trials: int, seed: int) -> MonteCarloResult:
+    quantities = []
+    for record in json.loads(signature):
+        if record.get("degrees_of_freedom") is None:
+            record["degrees_of_freedom"] = math.inf
+        quantities.append(QuantityInput(**record))
+    return monte_carlo(parse_model(formula), quantities, confidence, trials, seed)
+
+
+def _quantity_signature(quantities: list[QuantityInput]) -> str:
+    records = []
+    for item in quantities:
+        records.append(
+            {
+                "name": item.name,
+                "value_expression": item.value_expression,
+                "unit": item.unit,
+                "kind": item.kind,
+                "distribution": item.distribution,
+                "uncertainty_expression": item.uncertainty_expression,
+                "coverage_factor": item.coverage_factor,
+                "degrees_of_freedom": None if math.isinf(item.degrees_of_freedom) else item.degrees_of_freedom,
+                "comment": "",
+                "measurements": item.measurements,
+                "uncertainty_of_mean": item.uncertainty_of_mean,
+                "use_mean_as_value": item.use_mean_as_value,
+                "pooled_stdev": item.pooled_stdev,
+                "pooled_degrees_of_freedom": (
+                    None if item.pooled_degrees_of_freedom is None or math.isinf(item.pooled_degrees_of_freedom)
+                    else item.pooled_degrees_of_freedom
+                ),
+                "direct_stdev": item.direct_stdev,
+                "direct_count": item.direct_count,
+            }
+        )
+    return json.dumps(records, ensure_ascii=False)
+
+
+def show_monte_carlo(result: MonteCarloResult, budget: Budget) -> None:
+    unit = st.session_state.result_unit.strip()
+    suffix = f" {unit}" if unit else ""
+    metrics = st.columns(4)
+    metrics[0].metric("gemiddelde", fmt(result.mean) + suffix)
+    metrics[1].metric("standaardonzekerheid uc", fmt(result.standard_uncertainty) + suffix)
+    metrics[2].metric("ondergrens", fmt(result.low) + suffix)
+    metrics[3].metric("bovengrens", fmt(result.high) + suffix)
+    level = fmt(100 * result.confidence)
+    st.markdown(
+        f"<p>{quantity_html(result.output)} ligt tussen {html.escape(fmt(result.low))} en "
+        f"{html.escape(fmt(result.high))}{html.escape(suffix)} "
+        f"({html.escape(level)} %). "
+        f"GUM: {html.escape(fmt(budget.nominal - budget.expanded))} tot "
+        f"{html.escape(fmt(budget.nominal + budget.expanded))}{html.escape(suffix)} "
+        f"rond {html.escape(fmt(budget.nominal))}.</p>",
+        unsafe_allow_html=True,
+    )
+    rejected = result.trials - result.accepted
+    if rejected:
+        st.caption(
+            f"{_grouped(rejected)} van de {_grouped(result.trials)} trekkingen zijn weggelaten "
+            "omdat de formule daar geen eindig getal gaf."
+        )
+    if result.heavy_tail:
+        st.caption(
+            "Minstens één normale of Type A-grootheid heeft 2 of minder vrijheidsgraden. "
+            "De t-verdeling heeft dan geen eindige variantie, zodat uc sterk van de trekking afhangt."
+        )
+    show_monte_carlo_chart(result, budget, suffix.strip())
+    with st.expander("Rekenmethode"):
+        st.markdown(
+            """
+De trekkingen zijn onafhankelijk. Het midden van elke verdeling is de nominale waarde uit het budget.
+
+- Bij een normale verdeling met oneindig veel vrijheidsgraden is de trekking normaal met standaardafwijking u.
+- Bij een normale verdeling of bij type A met eindige vrijheidsgraden wordt een t-verdeling met schaal u gebruikt.
+- Bij rechthoekig is de trekking uniform tussen waarde − a en waarde + a.
+- Bij driehoekig ligt de trekking tussen waarde − a en waarde + a, met de top bij de waarde.
+
+uc is de standaardafwijking van de uitkomsten. Het interval is het tweezijdige kwantiel bij het gekozen betrouwbaarheidsniveau.
+"""
+        )
+
+
+def show_monte_carlo_chart(result: MonteCarloResult, budget: Budget, unit: str) -> None:
+    if len(result.edges) < 2:
+        st.caption("Elke trekking geeft dezelfde uitkomst.")
+        return
+    title = result.output + (f" ({unit})" if unit else "")
+    edges = result.edges
+    bins = pd.DataFrame(
+        {
+            "links": edges[:-1],
+            "rechts": edges[1:],
+            "aantal": result.counts,
+        }
+    )
+    gum_low = budget.nominal - budget.expanded
+    gum_high = budget.nominal + budget.expanded
+    lines = pd.DataFrame(
+        {
+            "positie": [result.mean, result.low, result.high, gum_low, gum_high],
+            "lijn": ["gemiddelde", "Monte Carlo", "Monte Carlo", "GUM", "GUM"],
+        }
+    )
+    span = edges[-1] - edges[0]
+    pad = span * 0.08 if span else 1
+    domain = [edges[0] - pad, edges[-1] + pad]
+    bars = (
+        alt.Chart(bins)
+        .mark_bar(color="#1f4e79", opacity=0.85)
+        .encode(
+            x=alt.X("links:Q", title=title, scale=alt.Scale(domain=domain, zero=False)),
+            x2="rechts:Q",
+            y=alt.Y("aantal:Q", title="Aantal trekkingen"),
+            tooltip=[
+                alt.Tooltip("links:Q", title="van", format=".6g"),
+                alt.Tooltip("rechts:Q", title="tot", format=".6g"),
+                alt.Tooltip("aantal:Q", title="aantal"),
+            ],
+        )
+    )
+    rules = (
+        alt.Chart(lines)
+        .mark_rule(strokeWidth=2)
+        .encode(
+            x="positie:Q",
+            color=alt.Color(
+                "lijn:N",
+                title="Lijn",
+                scale=alt.Scale(
+                    domain=["gemiddelde", "Monte Carlo", "GUM"],
+                    range=["#1f4e79", "#b45309", "#6b7280"],
+                ),
+            ),
+        )
+    )
+    st.altair_chart(alt.layer(bars, rules).properties(height=280), width="stretch")
+    st.caption("Blauwe staven: verdeling van de uitkomst. Blauw: gemiddelde. Oranje: Monte Carlo-interval. Grijs: GUM-interval.")
+
+
+def _grouped(value: int) -> str:
+    return f"{value:,}".replace(",", ".")
 
 
 def render_sweep(model: ParsedModel, rows: list[dict]) -> None:
@@ -786,10 +1122,11 @@ def unit_of(rows: list[dict], name: str) -> str:
 
 def quantity_from_row(row: dict) -> QuantityInput:
     name = str(row["variabele"])
-    kind = "A" if str(row["type"]).endswith("A") else "B"
+    kind = "A" if canonical_type(row["type"]) == "A" else "B"
     stored = st.session_state.measurements.get(name, {})
     if kind == "A" and stored.get("error"):
         raise FormulaError(str(stored["error"]))
+    direct = kind == "A" and type_a_method(name) == "s"
     return QuantityInput(
         name=name,
         value_expression=str(row.get("waarde", "")),
@@ -797,14 +1134,16 @@ def quantity_from_row(row: dict) -> QuantityInput:
         kind=kind,
         distribution=str(row.get("verdeling", "Normaal")),
         uncertainty_expression=str(row.get("onzekerheid", "")),
-        coverage_factor=parse_positive(str(row.get("k", "1")), f"k van {name}", default=1.0),
+        coverage_factor=parse_positive(str(row.get("k", "2")), f"k van {name}", default=2.0),
         degrees_of_freedom=parse_dof(str(row.get("vrijheidsgraden", "∞")), name),
         comment=str(row.get("opmerking", "")),
-        measurements=stored.get("values") if kind == "A" else None,
+        measurements=None if direct or kind != "A" else stored.get("values"),
         uncertainty_of_mean=bool(st.session_state.get(f"sqrtn_{name}", stored.get("of_mean", True))),
-        use_mean_as_value=bool(st.session_state.get(f"mean_{name}", stored.get("use_mean", True))),
-        pooled_stdev=stored.get("pooled_stdev") if kind == "A" else None,
-        pooled_degrees_of_freedom=stored.get("pooled_degrees") if kind == "A" else None,
+        use_mean_as_value=False if direct else bool(st.session_state.get(f"mean_{name}", stored.get("use_mean", True))),
+        pooled_stdev=None if direct else stored.get("pooled_stdev") if kind == "A" else None,
+        pooled_degrees_of_freedom=None if direct else stored.get("pooled_degrees") if kind == "A" else None,
+        direct_stdev=stored.get("direct_stdev") if direct else None,
+        direct_count=stored.get("direct_count") if direct else None,
     )
 
 
@@ -833,7 +1172,9 @@ def parse_positive(text: str, label: str, default: float) -> float:
 
 
 def _clean_row(row: dict) -> dict:
-    return {column: "" if row.get(column) is None else str(row.get(column)) for column in COLUMNS if column != "variabele"}
+    cleaned = {column: "" if row.get(column) is None else str(row.get(column)) for column in COLUMNS if column != "variabele"}
+    cleaned["type"] = canonical_type(cleaned.get("type", "B"))
+    return cleaned
 
 
 def fmt(value: float) -> str:
@@ -843,6 +1184,9 @@ def fmt(value: float) -> str:
 
 
 def render_storage() -> None:
+    pending_name = st.session_state.pop("pending_save_name", None)
+    if pending_name is not None:
+        st.session_state.save_name = pending_name
     st.subheader("Meting bewaren")
     notice = st.session_state.pop("storage_notice", None)
     if notice:
@@ -874,6 +1218,7 @@ def render_storage() -> None:
 def measurement_payload() -> dict:
     return {
         "versie": 1,
+        "naam": st.session_state.get("save_name", ""),
         "formule": st.session_state.get("formule", ""),
         "eenheid": st.session_state.get("result_unit", ""),
         "betrouwbaarheid": st.session_state.get("confidence", 0.95),
@@ -895,6 +1240,7 @@ def open_uploaded_measurement(upload) -> None:
         st.error(f"deze meting kan niet worden geopend: {exc}")
         return
     st.session_state.measurement_generation = st.session_state.get("measurement_generation", 0) + 1
+    st.session_state.pending_save_name = measurement_name(upload, payload)
     st.session_state.storage_notice = f"Geopend: {upload.name}."
     st.rerun()
 
@@ -920,6 +1266,11 @@ def apply_payload(payload: dict) -> None:
             series = "\n".join(fmt(value) for value in values)
         pooled = str(item.get("pooled") or "")
         pooled_dof = str(item.get("pooled_dof") or "")
+        method = str(item.get("method") or "")
+        if method not in _METHOD_LABEL:
+            method = "bestand" if item.get("filename") else "reeks" if series or values else "s"
+        stdev = str(item.get("stdev") or "")
+        count = str(item.get("count") or "")
         measurements[str(name)] = {
             "filename": str(item.get("filename") or ""),
             "column": item.get("column"),
@@ -927,12 +1278,18 @@ def apply_payload(payload: dict) -> None:
             "series": series,
             "pooled": pooled,
             "pooled_dof": pooled_dof,
+            "method": method,
+            "stdev": stdev,
+            "count": count,
             "use_mean": bool(item.get("use_mean", True)),
             "of_mean": bool(item.get("of_mean", True)),
         }
         st.session_state[f"series_{name}"] = series
         st.session_state[f"pooled_{name}"] = pooled
         st.session_state[f"pooled_dof_{name}"] = pooled_dof
+        st.session_state[f"stdev_{name}"] = stdev
+        st.session_state[f"count_{name}"] = count
+        st.session_state[f"method_{name}"] = _METHOD_LABEL[method]
         st.session_state[f"mean_{name}"] = bool(item.get("use_mean", True))
         st.session_state[f"sqrtn_{name}"] = bool(item.get("of_mean", True))
         st.session_state.csv_generation[str(name)] = st.session_state.csv_generation.get(str(name), 0) + 1
@@ -966,8 +1323,11 @@ def type_a_for_save() -> dict:
         series = str(st.session_state.get(f"series_{name}", stored.get("series") or ""))
         pooled = str(st.session_state.get(f"pooled_{name}", stored.get("pooled") or ""))
         pooled_dof = str(st.session_state.get(f"pooled_dof_{name}", stored.get("pooled_dof") or ""))
+        stdev_text = str(st.session_state.get(f"stdev_{name}", stored.get("stdev") or ""))
+        count_text = str(st.session_state.get(f"count_{name}", stored.get("count") or ""))
         values = stored.get("values") or []
-        if not values and not series.strip() and not pooled.strip():
+        method = type_a_method(name)
+        if not any((values, series.strip(), pooled.strip(), stdev_text.strip(), count_text.strip(), stored.get("filename"))):
             continue
         stored_sets[name] = {
             "filename": stored.get("filename") or "",
@@ -976,6 +1336,9 @@ def type_a_for_save() -> dict:
             "series": series,
             "pooled": pooled,
             "pooled_dof": pooled_dof,
+            "method": method,
+            "stdev": stdev_text,
+            "count": count_text,
             "use_mean": bool(st.session_state.get(f"mean_{name}", stored.get("use_mean", True))),
             "of_mean": bool(st.session_state.get(f"sqrtn_{name}", stored.get("of_mean", True))),
         }
@@ -985,6 +1348,16 @@ def type_a_for_save() -> dict:
 def download_filename(name: str) -> str:
     cleaned = _NAME.sub("", str(name)).strip()
     return f"{cleaned or 'meting'}.json"
+
+
+def measurement_name(upload, payload: dict) -> str:
+    stored = str(payload.get("naam") or "").strip()
+    if stored:
+        return stored
+    filename = str(getattr(upload, "name", "") or "").strip()
+    if filename.lower().endswith(".json"):
+        filename = filename[:-5]
+    return filename.strip()
 
 
 def report_filename(name: str) -> str:
@@ -1163,10 +1536,11 @@ def render_word_button(
     rows: list[dict],
     budget: Budget | None,
     error: str,
+    monte_carlo_result: MonteCarloResult | None = None,
 ) -> None:
     st.download_button(
         "Download rapport",
-        data=word_document(model, rows, budget, error),
+        data=word_document(model, rows, budget, error, monte_carlo_result),
         file_name=report_filename(st.session_state.get("save_name", "")),
         mime="text/html",
         key="word_report",
@@ -1179,6 +1553,7 @@ def word_document(
     rows: list[dict],
     budget: Budget | None,
     error: str,
+    monte_carlo_result: MonteCarloResult | None = None,
 ) -> str:
     if not rows:
         rows = [
@@ -1249,6 +1624,17 @@ def word_document(
                 ["Grootheid", "Waarde", "Eenheid", "Type", "Verdeling", "Omrekening", "u", "ν", "c", "c·u", "Aandeel", "Opmerking"],
                 budget_rows,
             )
+        )
+    if monte_carlo_result is not None:
+        suffix = f" {html.escape(unit)}" if unit else ""
+        sections.append("<h2>Monte Carlo</h2>")
+        sections.append(
+            f"<p>{_grouped(monte_carlo_result.trials)} trekkingen, startwaarde {monte_carlo_result.seed}. "
+            f"Gemiddelde {html.escape(fmt(monte_carlo_result.mean))}{suffix}, "
+            f"uc {html.escape(fmt(monte_carlo_result.standard_uncertainty))}{suffix}, "
+            f"interval {html.escape(fmt(monte_carlo_result.low))} tot "
+            f"{html.escape(fmt(monte_carlo_result.high))}{suffix} "
+            f"({html.escape(fmt(100 * monte_carlo_result.confidence))} %).</p>"
         )
     body = "\n".join(sections)
     return f"""<!DOCTYPE html>
